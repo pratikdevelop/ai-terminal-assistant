@@ -1,4 +1,3 @@
-```markdown
 # Local AI Chat CLI – Ultimate Edition
 
 A beautiful, feature-rich **terminal chat interface** for local LLMs via Ollama.
@@ -142,31 +141,3 @@ You can override defaults using environment variables:
 export OLLAMA_MODEL="llama3.2:3b"
 export OLLAMA_BASE_URL="http://localhost:11434/v1"
 ```
-
-## License
-
-This project is licensed under the **MIT License**.
-
-See the [LICENSE](./LICENSE) file for the full text.
-
-## Contributing
-
-Feel free to open issues or pull requests!
-
-Made with ❤️ for local AI enthusiasts  
-Pratik
-
-```
-
-### Next steps you might want to do now
-
-1. Create an empty `LICENSE` file in the root with MIT content:
-
-   You can copy the standard MIT text from here:  
-   https://opensource.org/license/mit  
-   or just run:
-
-   ```bash
-   echo -e "MIT License\n\nCopyright (c) $(date +%Y) Pratik\n\nPermission is hereby granted, free of charge, to any person obtaining a copy..." > LICENSE
-   ```
-
