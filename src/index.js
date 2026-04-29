@@ -5,18 +5,19 @@ import OpenAI from 'openai';
 import * as readline from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 import chalk from 'chalk';
-import fetch from 'node-fetch'; // ← add to dependencies: npm install node-fetch
+import fetch from 'node-fetch';
+import { encode } from 'gpt-tokenizer';
+import ora from 'ora';
 
 import {
   OLLAMA_BASE_URL,
-  MODEL_NAME as  defaultModel,
-  currentTemperature as  defaultTemp,
-  MAX_HISTORY,
+  MODEL_NAME as defaultModel,
+  currentTemperature as defaultTemp,
   SYSTEM_PROMPT_DEFAULT,
 } from './config.js';
 import { copyToClipboard } from './utils/clipboard.js';
-import { highlightCode } from './utils/highlight.js';
 import { handleCommand } from './utils/commands.js';
+import { openEditorForInput } from './utils/editor.js';
 
 // ─── OpenAI Client ────────────────────────────────────────────────────────
 const openai = new OpenAI({
@@ -24,9 +25,45 @@ const openai = new OpenAI({
   apiKey: 'ollama', // dummy value
 });
 
+async function checkOllamaConnection() {
+  try {
+    const res = await fetch(`${OLLAMA_BASE_URL.replace(/\/v1$/, '')}/api/tags`);
+    if (!res.ok) throw new Error();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function estimateTokens(history) {
+  let count = 0;
+  for (const msg of history) {
+    count += encode(msg.content || '').length;
+  }
+  return count;
+}
+
 // ─── Interactive Chat Mode ────────────────────────────────────────────────
 async function runInteractiveChat(options) {
+  const isOllamaRunning = await checkOllamaConnection();
+  if (!isOllamaRunning) {
+    console.log(chalk.red('\n✗ Error: Ollama daemon is not responding.'));
+    console.log(chalk.yellow(`Please start Ollama at ${OLLAMA_BASE_URL} before using the chat.\n`));
+    process.exit(1);
+  }
+
   const rl = readline.createInterface({ input, output });
+  let isGenerating = false;
+  let abortController = null;
+
+  rl.on('SIGINT', () => {
+    if (isGenerating && abortController) {
+      abortController.abort();
+    } else {
+      console.log(chalk.green('\nGoodbye! 👋\n'));
+      process.exit(0);
+    }
+  });
 
   let history = [{ role: 'system', content: SYSTEM_PROMPT_DEFAULT }];
   let multiLineMode = false;
@@ -38,16 +75,14 @@ async function runInteractiveChat(options) {
     isCodingMode: options.code || false,
   };
 
-  // Update system prompt if coding mode
   if (state.isCodingMode) {
     history[0].content =
       'You are an expert programmer. Always respond with clean, well-commented code when appropriate.';
   }
 
-  // Welcome banner
   console.log(chalk.bold.blue('┌──────────────────────────────────────────────────────────────┐'));
   console.log(chalk.bold.blue('│             🚀 LOCAL AI CHAT – Developer Edition             │'));
-  console.log(chalk.bold.blue('│  Type /help for commands   •   Ctrl+C to exit               │'));
+  console.log(chalk.bold.blue('│  Type /help for commands   •   Ctrl+C to abort/exit         │'));
   console.log(chalk.bold.blue('└──────────────────────────────────────────────────────────────┘\n'));
 
   console.log(
@@ -57,8 +92,12 @@ async function runInteractiveChat(options) {
   );
 
   while (true) {
-    // ─── Status line ────────────────────────────────────────────────────
-    const ctxEstimate = Math.min(history.length * 4, 32000); // very rough
+    // Dynamically manage context window (arbitrarily keeping it under 30k tokens for local LLMs)
+    while (history.length > 2 && estimateTokens(history) > 30000) {
+      history.splice(1, 1); // remove oldest non-system message
+    }
+
+    const ctxEstimate = estimateTokens(history);
     console.log(chalk.dim('─'.repeat(60)));
     console.log(
       chalk.cyan('Model: ') +
@@ -69,7 +108,7 @@ async function runInteractiveChat(options) {
         chalk.gray('  |  ') +
         chalk.cyan('Mode: ') +
         (state.isCodingMode ? chalk.green('coding') : chalk.yellow('normal')) +
-        chalk.gray(`  |  ctx ~${ctxEstimate.toLocaleString()} tok`)
+        chalk.gray(`  |  ctx ~${ctxEstimate} tok`)
     );
     console.log(chalk.dim('─'.repeat(60)));
 
@@ -97,26 +136,41 @@ async function runInteractiveChat(options) {
     }
 
     // Command handling
-    const cmdResult = handleCommand(userInput, history, state);
+    const cmdResult = await handleCommand(userInput, history, state);
     if (cmdResult?.action === 'exit') {
       console.log(chalk.green('\nGoodbye! 👋\n'));
       break;
     }
-    if (cmdResult?.action === 'continue') {
+    if (cmdResult?.action === 'load') {
+      history = cmdResult.history;
+      continue;
+    }
+    if (cmdResult?.action === 'read') {
+      userInput = cmdResult.content;
+      console.log(chalk.cyan('File context loaded.\n'));
+    } else if (cmdResult?.action === 'editor') {
+      const editorContent = openEditorForInput();
+      if (!editorContent) {
+        console.log(chalk.gray('Editor closed with no content.\n'));
+        continue;
+      }
+      userInput = editorContent;
+      console.log(chalk.cyan('Loaded input from editor.\n'));
+    } else if (cmdResult?.action === 'continue') {
       continue;
     }
 
     console.log('');
 
+    let spinner;
+
     try {
       history.push({ role: 'user', content: userInput });
 
-      // Keep context length reasonable
-      if (history.length > MAX_HISTORY) {
-        history.splice(1, history.length - MAX_HISTORY);
-      }
+      abortController = new AbortController();
+      isGenerating = true;
 
-      process.stdout.write(chalk.bold.cyan('AI  : '));
+      spinner = ora('Thinking...').start();
 
       const stream = await openai.chat.completions.create({
         model: state.MODEL_NAME,
@@ -124,11 +178,17 @@ async function runInteractiveChat(options) {
         temperature: state.currentTemperature,
         max_tokens: 4096,
         stream: true,
-      });
+      }, { signal: abortController.signal });
 
       let fullAnswer = '';
+      let firstChunk = true;
 
       for await (const chunk of stream) {
+        if (firstChunk) {
+          spinner.stop();
+          process.stdout.write(chalk.bold.cyan('AI  : '));
+          firstChunk = false;
+        }
         const delta = chunk.choices[0]?.delta?.content || '';
         if (delta) {
           process.stdout.write(delta);
@@ -136,35 +196,51 @@ async function runInteractiveChat(options) {
         }
       }
 
+      if (firstChunk) {
+        // stream ended without any chunks
+        spinner.stop();
+        process.stdout.write(chalk.bold.cyan('AI  : '));
+      }
+
       console.log('\n');
 
-      const highlighted = highlightCode(fullAnswer);
-      console.log(highlighted);
-      console.log(chalk.gray('─'.repeat(60) + '\n'));
-
       history.push({ role: 'assistant', content: fullAnswer });
-
       await copyToClipboard(fullAnswer);
+
     } catch (err) {
-      console.error(chalk.red('\nError:'), err.message);
-      if (err.message.includes('model') || err.message.includes('not found')) {
-        console.log(
-          chalk.yellow(`\nTip:  ollama pull ${state.MODEL_NAME}\n`) +
-            chalk.gray('      or use /model <name> to switch\n')
-        );
+      if (spinner && spinner.isSpinning) spinner.stop();
+      
+      if (err.name === 'AbortError') {
+        console.log(chalk.yellow('\n[Generation aborted by user]\n'));
+        // Prune the user's latest query so it doesn't get stuck in context without an answer
+        history.pop();
+      } else {
+        console.error(chalk.red('\nError:'), err.message);
+        if (err.message.includes('model') || err.message.includes('not found')) {
+          console.log(
+            chalk.yellow(`\nTip:  ollama pull ${state.MODEL_NAME}\n`) +
+              chalk.gray('      or use /model <name> to switch\n')
+          );
+        }
       }
+    } finally {
+      isGenerating = false;
+      abortController = null;
     }
   }
 
   rl.close();
+  process.exit(0);
 }
 
 // ─── List Models Command ──────────────────────────────────────────────────
 async function listOllamaModels() {
   try {
-    const res = await fetch(`${OLLAMA_BASE_URL.replace(/\/v1$/, '')}/api/tags`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const { models } = await res.json();
+    const res = await checkOllamaConnection();
+    if (!res) throw new Error(`Ollama daemon on ${OLLAMA_BASE_URL} is not responding.`);
+    
+    const tagsRes = await fetch(`${OLLAMA_BASE_URL.replace(/\/v1$/, '')}/api/tags`);
+    const { models } = await tagsRes.json();
 
     if (!models?.length) {
       console.log(chalk.yellow('No models found. Pull one with: ollama pull llama3.2'));
@@ -183,8 +259,7 @@ async function listOllamaModels() {
   } catch (err) {
     console.error(
       chalk.red('Failed to list models:'),
-      err.message,
-      chalk.gray('\nIs Ollama running on ' + OLLAMA_BASE_URL + ' ?')
+      err.message
     );
   }
 }
